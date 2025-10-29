@@ -21,8 +21,6 @@ COPY . /app
 # ---- 6. Важные переменные окружения ----
 # Cloud Run по умолчанию слушает PORT, поэтому выставляем
 ENV PORT=8080
-# Говорим firebase_admin, где искать ключ сервис-аккаунта
-ENV GOOGLE_APPLICATION_CREDENTIALS="/app/serviceAccountKey.json"
 
 # ---- 7. Запускаем наш FastAPI через uvicorn ----
 CMD ["uvicorn", "src.webhook.main:app", "--host", "0.0.0.0", "--port", "8080"]
