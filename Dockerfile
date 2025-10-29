@@ -15,6 +15,7 @@ ENV BUILD_TS=${BUILD_TS}
 
 # 5. Копируем зависимости отдельно (чтобы не пересобирать тяжёлые пакеты без нужды)
 COPY requirements.txt /app/requirements.txt
+COPY serviceAccountKey.json /app/serviceAccountKey.json
 
 # 6. Ставим зависимости
 RUN pip install --upgrade pip && \
