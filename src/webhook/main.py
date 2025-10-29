@@ -29,17 +29,19 @@ try:
     from firebase_admin import credentials, firestore
 
     if not firebase_admin._apps:
-        # settings.gcp_credentials_path и settings.gcp_project_id должны быть в config.py
-        cred = credentials.Certificate(settings.gcp_credentials_path)
+        # Без локального JSON-ключа.
+        # Cloud Run сам даёт креды через сервисный аккаунт
+        cred = credentials.ApplicationDefault()
         firebase_admin.initialize_app(cred, {
             "projectId": settings.gcp_project_id
         })
 
     db = firestore.client()
-    print("✅ Firestore initialized successfully")
+    print("✅ Firestore initialized with ApplicationDefault()")
 except Exception as e:
     print("❌ Firestore init failed:", e)
-    db = None  # дальше не падаем, бот всё равно будет отвечать
+    db = None
+
 
 
 app = FastAPI()
