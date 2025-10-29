@@ -1,0 +1,23 @@
+# виртуальное окружение
+.venv/
+venv/
+env/
+
+# кэш питона
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# локальные артефакты
+*.log
+
+# секреты
+.env
+serviceAccountKey.json
+*.key.json
+
+# локальные тестовые файлы
+local_webhook_test.py
