@@ -1,31 +1,28 @@
-# 1. Базовый образ
+# ---- 1. Базовый образ Python ----
 FROM python:3.11-slim
 
-# 2. Чтобы не было вопросов от apt
-ENV DEBIAN_FRONTEND=noninteractive
-
-# 3. Рабочая директория внутри контейнера
+# ---- 2. Рабочая директория в контейнере ----
 WORKDIR /app
 
-# 4. Пробиваем кэш.
-#    Эта переменная будет меняться на каждом билде и ломать кэш.
-#    Можешь руками менять значение BUILD_TS если вдруг снова увидим "застрял на старом коде".
-ARG BUILD_TS=2025-10-29-01
-ENV BUILD_TS=${BUILD_TS}
-
-# 5. Копируем зависимости отдельно (чтобы не пересобирать тяжёлые пакеты без нужды)
+# ---- 3. Копируем зависимости отдельно, чтобы слои кэшировались ----
 COPY requirements.txt /app/requirements.txt
-COPY serviceAccountKey.json /app/serviceAccountKey.json
 
-# 6. Ставим зависимости
-RUN pip install --upgrade pip && \
+# ---- 4. Ставим зависимости ----
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /app/requirements.txt
 
-# 7. Копируем весь проект
+# ---- 5. Копируем весь исходный код проекта внутрь контейнера ----
+# включая src/, Dockerfile кладёт всё что есть в репозитории
 COPY . /app
 
-# 8. Добавляем PYTHONPATH, чтобы можно было делать `from config import settings`
-ENV PYTHONPATH=/app
+# На этом шаге внутрь образа попадёт и serviceAccountKey.json,
+# потому что он лежит в корне репозитория рядом с Dockerfile.
 
-# 9. Uvicorn слушает порт, который Cloud Run передаёт через $PORT
-CMD exec uvicorn src.webhook.main:app --host 0.0.0.0 --port ${PORT}
+# ---- 6. Важные переменные окружения ----
+# Cloud Run по умолчанию слушает PORT, поэтому выставляем
+ENV PORT=8080
+# Говорим firebase_admin, где искать ключ сервис-аккаунта
+ENV GOOGLE_APPLICATION_CREDENTIALS="/app/serviceAccountKey.json"
+
+# ---- 7. Запускаем наш FastAPI через uvicorn ----
+CMD ["uvicorn", "src.webhook.main:app", "--host", "0.0.0.0", "--port", "8080"]
