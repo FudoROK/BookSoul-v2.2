@@ -1,6 +1,8 @@
-import os
+# src/data_layer/firestore_client.py
+
 from typing import Optional, Dict, Any, List
 from google.cloud import firestore
+from google.auth import default
 from datetime import datetime
 
 
@@ -17,14 +19,15 @@ class FirestoreClient:
     """
 
     def __init__(self,
-                 project_id: str = "booksoulv2",
-                 credentials_path: str = "serviceAccountKey.json",
+                 project_id: Optional[str] = "booksoulv2",
                  root_collection: str = "books"):
-        # Готовим окружение для google-cloud-firestore
-        os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
+        # ADC авторизация без JSON-ключа
+        creds, adc_project = default()
+        self.project_id = project_id or adc_project
+        if not self.project_id:
+            raise RuntimeError("FirestoreClient: project_id не определён (ни в аргументе, ни в ADC).")
 
-        self.db = firestore.Client(project=project_id)
+        self.db = firestore.Client(project=self.project_id, credentials=creds)
         self.root_collection = root_collection  # обычно "books"
 
     # ---------------------------------------------------------------------------------
@@ -280,7 +283,6 @@ class FirestoreClient:
 if __name__ == "__main__":
     client = FirestoreClient(
         project_id="booksoulv2",
-        credentials_path="serviceAccountKey.json",  # поменяй если у тебя другое имя
         root_collection="books",
     )
 

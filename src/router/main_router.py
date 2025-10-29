@@ -1,3 +1,5 @@
+# src/router/main_router.py
+
 import os
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -20,11 +22,9 @@ class BookSoulRouter:
     """
 
     def __init__(self,
-                 project_id: str = "booksoulv2",
-                 credentials_path: str = "serviceAccountKey.json"):
+                 project_id: str = "booksoulv2"):
         self.fs = FirestoreClient(
             project_id=project_id,
-            credentials_path=credentials_path,
             root_collection="books"
         )
 
@@ -274,7 +274,6 @@ class BookSoulRouter:
 if __name__ == "__main__":
     router = BookSoulRouter(
         project_id="booksoulv2",
-        credentials_path="serviceAccountKey.json",  # поменяй если ключ называется иначе
     )
 
     # 1. создаём новую книгу

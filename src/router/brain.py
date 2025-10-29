@@ -1,3 +1,4 @@
+# src/brain.py
 
 import os
 import sys
@@ -34,11 +35,9 @@ class RouterBrain:
     def __init__(
         self,
         project_id: str = "booksoulv2",
-        credentials_path: str = "serviceAccountKey.json"
     ):
         self.router = BookSoulRouter(
             project_id=project_id,
-            credentials_path=credentials_path,
         )
 
     # ===========================
@@ -220,7 +219,6 @@ class RouterBrain:
 if __name__ == "__main__":
     brain = RouterBrain(
         project_id="booksoulv2",
-        credentials_path="serviceAccountKey.json",  # если у тебя другой json - поменяй
     )
 
     # 1. Тест создания книги
