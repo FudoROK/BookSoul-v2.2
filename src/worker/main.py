@@ -1,6 +1,7 @@
+# src/worker/main.py
 from fastapi import FastAPI
 from google.cloud import firestore
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import httpx, os
 from openai import OpenAI
 
@@ -19,15 +20,15 @@ def health():
 def tick():
     """
     Периодический обработчик:
-    1) Бронирует pending-задачи (status -> processing) в транзакции
-    2) Шлёт быстрый баннер-ACK
-    3) Получает ответ от GPT и шлёт его
+    1) Транзакционно «лизует» pending-задачи (status -> processing)
+    2) Отправляет быстрый баннер-ACK
+    3) Запрашивает ответ у GPT и отправляет его
     4) Помечает задачу как done
     """
     now = datetime.now(timezone.utc)
     processed = 0
 
-    # 1) Лизинг задач (без падений, корректная транзакция Firestore)
+    # 1) Лизинг задач (корректная транзакция Firestore)
     jobs = lease_pending_jobs(db, limit=3)
 
     for job in jobs:
@@ -40,7 +41,7 @@ def tick():
             if chat_id:
                 send_message(chat_id, "📖 𝗕𝗼𝗼𝗸𝗦𝗼𝘂𝗹 · AI Soul Factory 🌿")
 
-            # 3) мягкий ответ GPT (если есть текст)
+            # 3) мягкий ответ GPT
             if text and chat_id:
                 gpt_reply = generate_reply(text)
                 if gpt_reply:
@@ -65,51 +66,46 @@ def tick():
 
 def lease_pending_jobs(db_client: firestore.Client, limit: int = 3):
     """
-    Бронируем pending-задачи транзакционно:
-    - читаем документы со status='pending'
-    - для каждого пробуем в транзакции сменить статус на 'processing'
+    Транзакционно «бронируем» pending-задачи:
+    - читаем кандидатов со status='pending'
+    - для каждого пытаемся в транзакции сменить статус на 'processing'
     - возвращаем только успешно «забронированные» задачи
     """
     leased = []
     try:
-        # читаем кандидатов (stream, чтобы не грузить всё)
-        candidates = db_client.collection("jobs_inbox") \
-                              .where("status", "==", "pending") \
-                              .limit(limit) \
-                              .stream()
+        candidates = (
+            db_client.collection("jobs_inbox")
+            .where("status", "==", "pending")
+            .limit(limit)
+            .stream()
+        )
     except Exception as e_query:
         print("lease query error:", e_query)
         return leased
 
     for snap in candidates:
         doc_ref = snap.reference
+        tx = db_client.transaction()
 
-        try:
-            # корректная транзакция в Python SDK
-            tx = db_client.transaction()
-
-            # читаем внутри транзакции
-            current = doc_ref.get(transaction=tx)
+        @firestore.transactional
+        def _lease(transaction, ref):
+            # Читаем документ внутри транзакции
+            current = ref.get(transaction=transaction)
             data = current.to_dict() or {}
-
             if data.get("status") == "pending":
-                # меняем статус на processing
-                tx.update(doc_ref, {
+                # Ставим «processing» атомарно
+                transaction.update(ref, {
                     "status": "processing",
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 })
-                # важный момент: фиксируем транзакцию вручную
-                tx.commit()
+                # Возвращаем снимок данных для дальнейшей обработки
+                return {"id": ref.id, **data}
+            return None
 
-                # кладём в список для дальнейшей обработки
-                leased.append({
-                    "id": doc_ref.id,
-                    **data
-                })
-            else:
-                # ничего не делаем, не pending
-                pass
-
+        try:
+            result = _lease(tx, doc_ref)
+            if result:
+                leased.append(result)
         except Exception as e_tx:
             print("Lease transaction failed:", e_tx)
 
@@ -133,7 +129,7 @@ def send_message(chat_id: int, text: str):
 def get_openai_client() -> OpenAI | None:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("ℹ️ OPENAI_API_KEY is not set — skipping GPT-5 call")
+        print("ℹ️ OPENAI_API_KEY is not set — skipping GPT call")
         return None
     try:
         return OpenAI(api_key=api_key)
@@ -145,7 +141,7 @@ def get_openai_client() -> OpenAI | None:
 def generate_reply(prompt: str) -> str | None:
     client_ai = get_openai_client()
     if client_ai is None:
-        # нейтральный fallback
+        # Нейтральный fallback, если ключа нет
         return "Я принял ваше сообщение. Вернусь с ответом чуть позже. ✨"
 
     try:
@@ -153,8 +149,9 @@ def generate_reply(prompt: str) -> str | None:
             model="gpt-5",
             input=f"User said: {prompt}\n\nAnswer as BookSoul: be clear, kind, short.",
         )
+        # в Responses API структура такая: output[...].content[...].text
         message = completion.output[0].content[0].text
         return message.strip()
     except Exception as e:
-        print("GPT-5 error:", e)
+        print("GPT error:", e)
         return "Веду обработку сообщения. Пожалуйста, подождите немного. 🤖"
