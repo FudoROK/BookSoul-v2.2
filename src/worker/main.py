@@ -1,197 +1,157 @@
-from fastapi import FastAPI, Query
+# src/worker/main.py
+from __future__ import annotations
+
+import os
+import logging
+from typing import Any, Dict, Optional
+
+import httpx
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
 from google.cloud import firestore
-from datetime import datetime, timezone
-import httpx, os
-from openai import OpenAI
 
-app = FastAPI()
-db = firestore.Client()
+# ---- ЛОГИ ----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("booksoul-worker")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+app = FastAPI(title="BookSoul Worker", version="0.1.0")
 
+# ---- ENV HELPERS ----
+def env(name: str) -> Optional[str]:
+    v = os.getenv(name)
+    if isinstance(v, str):
+        v = v.strip()
+    return v or None
 
-def tg_url(method: str) -> str:
+def telegram_api_base() -> str:
+    # Позволяет переопределить базу через TELEGRAM_API_BASE (напр., для прокси),
+    # но по умолчанию используем официальный endpoint
+    return env("TELEGRAM_API_BASE") or "https://api.telegram.org"
+
+def telegram_token() -> Optional[str]:
+    return env("TELEGRAM_BOT_TOKEN")
+
+# ---- LAZY FIRESTORE ----
+_db: Optional[firestore.Client] = None
+
+def get_db() -> firestore.Client:
+    global _db
+    if _db is None:
+        _db = firestore.Client()
+        log.info("Firestore client initialized.")
+    return _db
+
+# ---- HTTP HELPERS ----
+def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Корректно собираем URL Telegram API:
-    - если токен уже начинается с 'bot', не добавляем второй раз;
-    - иначе добавляем стандартный префикс 'bot'.
+    Выполняет Telegram API вызов.
+    method: 'sendMessage' | 'getMe' | ...
+    payload: dict параметров метода
     """
-    token = TELEGRAM_BOT_TOKEN or ""
+    token = telegram_token()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
+    base = telegram_api_base().rstrip("/")
+    # защитимся от двойного 'bot'
     if token.startswith("bot"):
-        return f"https://api.telegram.org/{token}/{method}"
-    return f"https://api.telegram.org/bot{token}/{method}"
+        url = f"{base}/{token}/{method}"
+    else:
+        url = f"{base}/bot{token}/{method}"
 
+    with httpx.Client(timeout=10) as client:
+        r = client.post(url, json=payload)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "status_code": r.status_code, "text": r.text}
+        return data if isinstance(data, dict) else {"ok": False, "status_code": r.status_code, "raw": data}
 
+# ---- ROUTES ----
 @app.get("/")
-def health():
+def health() -> Dict[str, Any]:
     return {"status": "ok", "service": "booksoul-worker"}
-
 
 @app.get("/tg_self")
 def tg_self():
     """
-    Диагностика: показать, каким ботом мы являемся (username, id).
+    Диагностика: дергает getMe у Telegram.
+    Удобно, чтобы проверить: токен виден ли воркером, сетка работает ли.
     """
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
-    url = tg_url("getMe")
+    token = telegram_token()
+    if not token:
+        return JSONResponse({"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"})
     try:
-        with httpx.Client(timeout=15) as c:
-            r = c.get(url)
-        return {"status_code": r.status_code, "json": r.json()}
+        base = telegram_api_base().rstrip("/")
+        url = f"{base}/bot{token[3:] if token.startswith('bot') else token}/getMe"
+        with httpx.Client(timeout=10) as client:
+            r = client.get(url)
+            return JSONResponse({"status_code": r.status_code, "json": r.json()})
     except Exception as e:
-        return {"ok": False, "error": f"getMe failed: {e}"}
+        log.exception("tg_self failed")
+        return JSONResponse({"ok": False, "error": str(e)})
 
-
-@app.get("/echo")
-def echo(chat_id: int = Query(...), text: str = Query("test")):
+@app.post("/echo")
+def echo(payload: Dict[str, Any] = Body(...)):
     """
-    Диагностика: пробная отправка сообщения в конкретный chat_id.
+    Простой эхо для проверки сети и JSON.
+    Пример: Invoke-WebRequest -Uri "<SERVICE>/echo" -Method POST -Body '{"a":1}' -ContentType "application/json"
     """
-    ok, info = send_message(chat_id, text)
-    return {"ok": ok, "info": info}
-
+    return {"ok": True, "payload": payload}
 
 @app.get("/tick")
 def tick():
     """
-    Плановый обработчик:
-    1) Лизуем pending-задачи транзакционно
-    2) Отправляем быстрый баннер
-    3) При наличии ключа — короткий GPT-ответ, иначе мягкий фолбэк
-    4) status -> done
+    Периодический запуск из Cloud Scheduler (каждую минуту).
+    1) Ищем заявки в jobs_inbox со статусом "pending".
+    2) Отправляем быстрый баннер в Telegram.
+    3) Обновляем статус на "done".
+    Никаких транзакций/локов — всё максимально просто и устойчиво.
     """
-    now = datetime.now(timezone.utc)
-    processed = 0
+    db = get_db()
 
-    jobs = lease_pending_jobs(db, limit=3)
-
-    for job in jobs:
-        doc_id = job["id"]
-        chat_id = job.get("chat_id")
-        text = job.get("user_text", "")
-
-        try:
-            if chat_id:
-                send_message(chat_id, "📖 𝗕𝗼𝗼𝗸𝗦𝗼𝘂𝗹 · AI Soul Factory 🌿")
-
-            if text and chat_id:
-                gpt_reply = generate_reply(text)
-                if gpt_reply:
-                    send_message(chat_id, gpt_reply)
-
-            try:
-                db.collection("jobs_inbox").document(doc_id).update({
-                    "status": "done",
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                })
-            except Exception as e_upd:
-                print(f"finalize error [{doc_id}]: {e_upd}")
-
-            processed += 1
-
-        except Exception as e:
-            print(f"job error [{doc_id}]: {e}")
-
-    return {"processed_jobs": processed, "time": now.isoformat()}
-
-
-def lease_pending_jobs(db_client: firestore.Client, limit: int = 3):
-    leased = []
     try:
-        candidates = (
-            db_client.collection("jobs_inbox")
+        docs = (
+            db.collection("jobs_inbox")
             .where("status", "==", "pending")
-            .limit(limit)
-            .stream()
+            .limit(5)
+            .get()
         )
-    except Exception as e_query:
-        print("lease query error:", e_query)
-        return leased
+    except Exception as e:
+        log.exception("Firestore query failed: %s", e)
+        return {"processed_jobs": 0, "error": str(e)}
 
-    for snap in candidates:
-        doc_ref = snap.reference
-        tx = db_client.transaction()
+    processed = 0
+    for snap in docs:
+        data = snap.to_dict() or {}
+        doc_id = snap.id
+        chat_id = data.get("chat_id")
+        user_text = data.get("user_text") or ""
+        log.info("Picked job %s (chat_id=%s, text=%s)", doc_id, chat_id, user_text[:60])
 
-        @firestore.transactional
-        def _lease(transaction, ref):
-            current = ref.get(transaction=transaction)
-            data = current.to_dict() or {}
-            if data.get("status") == "pending":
-                transaction.update(ref, {
-                    "status": "processing",
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                })
-                return {"id": ref.id, **data}
-            return None
+        # 1) Быстрый баннер
+        token = telegram_token()
+        if token and chat_id:
+            try:
+                banner = "📖 𝗕𝗼𝗼𝗸𝗦𝗼𝘂𝗹 · AI Soul Factory 🌿"
+                resp = tg_request("sendMessage", {"chat_id": chat_id, "text": banner})
+                if not resp.get("ok"):
+                    log.error("Telegram sendMessage failed for job %s: %s", doc_id, resp)
+                else:
+                    log.info("✅ Banner sent to %s", chat_id)
+            except Exception as e:
+                log.exception("Telegram send failed for job %s: %s", doc_id, e)
+        else:
+            if not token:
+                log.error("❌ TELEGRAM_BOT_TOKEN not set (job %s)", doc_id)
+            if not chat_id:
+                log.error("❌ chat_id missing (job %s)", doc_id)
 
+        # 2) Отмечаем заявкой как обработанную
         try:
-            result = _lease(tx, doc_ref)
-            if result:
-                leased.append(result)
-        except Exception as e_tx:
-            print("Lease transaction failed:", e_tx)
+            db.collection("jobs_inbox").document(doc_id).update({"status": "done"})
+            processed += 1
+        except Exception as e:
+            log.exception("Failed to update job %s to done: %s", doc_id, e)
 
-    return leased
-
-
-def send_message(chat_id: int, text: str):
-    """
-    Возвращает (ok: bool, info: dict) и логирует полный ответ Telegram.
-    """
-    if not TELEGRAM_BOT_TOKEN:
-        msg = "❌ TELEGRAM_BOT_TOKEN not set"
-        print(msg)
-        return False, {"error": msg}
-
-    url = tg_url("sendMessage")
-    data = {"chat_id": chat_id, "text": text}
-    try:
-        with httpx.Client(timeout=15) as client:
-            r = client.post(url, data=data)
-        info = {"status_code": r.status_code}
-        try:
-            j = r.json()
-            info["json"] = j
-            ok = bool(j.get("ok"))
-            desc = j.get("description")
-            if ok:
-                print(f"✅ Telegram OK → chat_id={chat_id}")
-            else:
-                print(f"❌ Telegram FAIL → chat_id={chat_id} | {desc}")
-            return ok, info
-        except Exception:
-            info["text"] = r.text
-            print(f"❌ Telegram non-JSON → chat_id={chat_id} | {r.status_code} | {r.text[:200]}")
-            return False, info
-    except Exception as e:
-        print(f"send_message error: {e}")
-        return False, {"error": str(e)}
-
-
-def get_openai_client() -> OpenAI | None:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("ℹ️ OPENAI_API_KEY is not set — skipping GPT call")
-        return None
-    try:
-        return OpenAI(api_key=api_key)
-    except Exception as e:
-        print("OpenAI init error:", e)
-        return None
-
-
-def generate_reply(prompt: str) -> str | None:
-    client_ai = get_openai_client()
-    if client_ai is None:
-        return "Я принял ваше сообщение. Вернусь с ответом чуть позже. ✨"
-    try:
-        completion = client_ai.responses.create(
-            model="gpt-5",
-            input=f"User said: {prompt}\n\nAnswer as BookSoul: be clear, kind, short.",
-        )
-        message = completion.output[0].content[0].text
-        return message.strip()
-    except Exception as e:
-        print("GPT error:", e)
-        return "Веду обработку сообщения. Пожалуйста, подождите немного. 🤖"
+    return {"processed_jobs": processed}
