@@ -1,8 +1,7 @@
-# src/worker/main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from google.cloud import firestore
 from datetime import datetime, timezone
-import httpx, os
+import httpx, os, json
 from openai import OpenAI
 
 app = FastAPI()
@@ -16,19 +15,43 @@ def health():
     return {"status": "ok", "service": "booksoul-worker"}
 
 
+@app.get("/tg_self")
+def tg_self():
+    """
+    Диагностика: показывает, каким ботом мы являемся (username, id).
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    try:
+        with httpx.Client(timeout=15) as c:
+            r = c.get(url)
+        return {"status_code": r.status_code, "json": r.json()}
+    except Exception as e:
+        return {"ok": False, "error": f"getMe failed: {e}"}
+
+
+@app.get("/echo")
+def echo(chat_id: int = Query(...), text: str = Query("test")):
+    """
+    Диагностика: пробная отправка сообщения в конкретный chat_id.
+    """
+    ok, info = send_message(chat_id, text)
+    return {"ok": ok, "info": info}
+
+
 @app.get("/tick")
 def tick():
     """
-    Периодический обработчик:
-    1) Транзакционно «лизует» pending-задачи (status -> processing)
-    2) Отправляет быстрый баннер-ACK
-    3) Запрашивает ответ у GPT и отправляет его
-    4) Помечает задачу как done
+    Плановый обработчик:
+    1) Транзакционно «лизуем» pending-задачи
+    2) Отправляем быстрый баннер
+    3) Если есть ключ — ответ GPT, иначе мягкий фолбэк
+    4) status -> done
     """
     now = datetime.now(timezone.utc)
     processed = 0
 
-    # 1) Лизинг задач (корректная транзакция Firestore)
     jobs = lease_pending_jobs(db, limit=3)
 
     for job in jobs:
@@ -37,17 +60,14 @@ def tick():
         text = job.get("user_text", "")
 
         try:
-            # 2) быстрый фирменный отклик-баннер
             if chat_id:
                 send_message(chat_id, "📖 𝗕𝗼𝗼𝗸𝗦𝗼𝘂𝗹 · AI Soul Factory 🌿")
 
-            # 3) мягкий ответ GPT
             if text and chat_id:
                 gpt_reply = generate_reply(text)
                 if gpt_reply:
                     send_message(chat_id, gpt_reply)
 
-            # 4) финализация: status -> done
             try:
                 db.collection("jobs_inbox").document(doc_id).update({
                     "status": "done",
@@ -65,12 +85,6 @@ def tick():
 
 
 def lease_pending_jobs(db_client: firestore.Client, limit: int = 3):
-    """
-    Транзакционно «бронируем» pending-задачи:
-    - читаем кандидатов со status='pending'
-    - для каждого пытаемся в транзакции сменить статус на 'processing'
-    - возвращаем только успешно «забронированные» задачи
-    """
     leased = []
     try:
         candidates = (
@@ -89,16 +103,13 @@ def lease_pending_jobs(db_client: firestore.Client, limit: int = 3):
 
         @firestore.transactional
         def _lease(transaction, ref):
-            # Читаем документ внутри транзакции
             current = ref.get(transaction=transaction)
             data = current.to_dict() or {}
             if data.get("status") == "pending":
-                # Ставим «processing» атомарно
                 transaction.update(ref, {
                     "status": "processing",
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 })
-                # Возвращаем снимок данных для дальнейшей обработки
                 return {"id": ref.id, **data}
             return None
 
@@ -113,17 +124,39 @@ def lease_pending_jobs(db_client: firestore.Client, limit: int = 3):
 
 
 def send_message(chat_id: int, text: str):
+    """
+    Возвращает (ok: bool, info: dict) и ЛОГИРУЕТ полный ответ Telegram.
+    Больше никаких ложных «✅ Sent…».
+    """
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN not set")
-        return
+        msg = "❌ TELEGRAM_BOT_TOKEN not set"
+        print(msg)
+        return False, {"error": msg}
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": chat_id, "text": text}
     try:
         with httpx.Client(timeout=15) as client:
-            client.post(url, data=data)
-        print(f"✅ Sent to {chat_id}")
+            r = client.post(url, data=data)
+        info = {"status_code": r.status_code}
+        # пытаемся распарсить json
+        try:
+            j = r.json()
+            info["json"] = j
+            ok = bool(j.get("ok"))
+            desc = j.get("description")
+            if ok:
+                print(f"✅ Telegram OK → chat_id={chat_id}")
+            else:
+                print(f"❌ Telegram FAIL → chat_id={chat_id} | {desc}")
+            return ok, info
+        except Exception:
+            info["text"] = r.text
+            print(f"❌ Telegram non-JSON → chat_id={chat_id} | {r.status_code} | {r.text[:200]}")
+            return False, info
     except Exception as e:
         print(f"send_message error: {e}")
+        return False, {"error": str(e)}
 
 
 def get_openai_client() -> OpenAI | None:
@@ -141,7 +174,6 @@ def get_openai_client() -> OpenAI | None:
 def generate_reply(prompt: str) -> str | None:
     client_ai = get_openai_client()
     if client_ai is None:
-        # Нейтральный fallback, если ключа нет
         return "Я принял ваше сообщение. Вернусь с ответом чуть позже. ✨"
 
     try:
@@ -149,7 +181,6 @@ def generate_reply(prompt: str) -> str | None:
             model="gpt-5",
             input=f"User said: {prompt}\n\nAnswer as BookSoul: be clear, kind, short.",
         )
-        # в Responses API структура такая: output[...].content[...].text
         message = completion.output[0].content[0].text
         return message.strip()
     except Exception as e:
