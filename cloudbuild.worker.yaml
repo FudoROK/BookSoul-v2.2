@@ -1,0 +1,5 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/booksoulv2/booksoul-worker', '-f', 'Dockerfile.worker', '.']
+images:
+  - 'gcr.io/booksoulv2/booksoul-worker'
