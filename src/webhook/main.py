@@ -47,7 +47,7 @@ TYPING_DURATION_SEC = int(os.getenv("TYPING_DURATION_SEC", "8"))
 
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-pro")  # название модели можно поменять в ENV
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # название модели можно поменять в ENV
 
 SYSTEM_PROMPT = (
     "You are the Director of BookSoul Factory. "
