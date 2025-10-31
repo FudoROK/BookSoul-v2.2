@@ -1,13 +1,25 @@
 from fastapi import FastAPI, Query
 from google.cloud import firestore
 from datetime import datetime, timezone
-import httpx, os, json
+import httpx, os
 from openai import OpenAI
 
 app = FastAPI()
 db = firestore.Client()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def tg_url(method: str) -> str:
+    """
+    Корректно собираем URL Telegram API:
+    - если токен уже начинается с 'bot', не добавляем второй раз;
+    - иначе добавляем стандартный префикс 'bot'.
+    """
+    token = TELEGRAM_BOT_TOKEN or ""
+    if token.startswith("bot"):
+        return f"https://api.telegram.org/{token}/{method}"
+    return f"https://api.telegram.org/bot{token}/{method}"
 
 
 @app.get("/")
@@ -18,11 +30,11 @@ def health():
 @app.get("/tg_self")
 def tg_self():
     """
-    Диагностика: показывает, каким ботом мы являемся (username, id).
+    Диагностика: показать, каким ботом мы являемся (username, id).
     """
     if not TELEGRAM_BOT_TOKEN:
         return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    url = tg_url("getMe")
     try:
         with httpx.Client(timeout=15) as c:
             r = c.get(url)
@@ -44,9 +56,9 @@ def echo(chat_id: int = Query(...), text: str = Query("test")):
 def tick():
     """
     Плановый обработчик:
-    1) Транзакционно «лизуем» pending-задачи
+    1) Лизуем pending-задачи транзакционно
     2) Отправляем быстрый баннер
-    3) Если есть ключ — ответ GPT, иначе мягкий фолбэк
+    3) При наличии ключа — короткий GPT-ответ, иначе мягкий фолбэк
     4) status -> done
     """
     now = datetime.now(timezone.utc)
@@ -125,21 +137,19 @@ def lease_pending_jobs(db_client: firestore.Client, limit: int = 3):
 
 def send_message(chat_id: int, text: str):
     """
-    Возвращает (ok: bool, info: dict) и ЛОГИРУЕТ полный ответ Telegram.
-    Больше никаких ложных «✅ Sent…».
+    Возвращает (ok: bool, info: dict) и логирует полный ответ Telegram.
     """
     if not TELEGRAM_BOT_TOKEN:
         msg = "❌ TELEGRAM_BOT_TOKEN not set"
         print(msg)
         return False, {"error": msg}
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = tg_url("sendMessage")
     data = {"chat_id": chat_id, "text": text}
     try:
         with httpx.Client(timeout=15) as client:
             r = client.post(url, data=data)
         info = {"status_code": r.status_code}
-        # пытаемся распарсить json
         try:
             j = r.json()
             info["json"] = j
@@ -175,7 +185,6 @@ def generate_reply(prompt: str) -> str | None:
     client_ai = get_openai_client()
     if client_ai is None:
         return "Я принял ваше сообщение. Вернусь с ответом чуть позже. ✨"
-
     try:
         completion = client_ai.responses.create(
             model="gpt-5",
