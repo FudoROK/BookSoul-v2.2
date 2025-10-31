@@ -6,6 +6,7 @@
 # 4) Индикатор "печатает…" (typing) на короткое время
 # 5) Вызов директора (GPT-5) на КАЖДОЕ сообщение и ответ в Telegram
 # 6) outbox-дедуп ответов по ключу <chat_id>:<update_id>
+# 7) DEBUG_ROUTER=true — расширенные логи вокруг вызова модели и отправки в Telegram
 
 from __future__ import annotations
 import os
@@ -55,6 +56,17 @@ SYSTEM_PROMPT = (
     "Avoid small talk. Keep it practical."
 )
 
+# Debug-флаг для расширенного логирования
+DEBUG_ROUTER = os.getenv("DEBUG_ROUTER", "false").lower() == "true"
+
+def _dlog(*args):
+    """Безопасный печатный лог только при DEBUG_ROUTER=true (секреты не логируем)."""
+    if DEBUG_ROUTER:
+        try:
+            print("[router]", *args)
+        except Exception:
+            pass
+
 # ----------------------------------------
 
 
@@ -67,6 +79,7 @@ def health():
 
 async def _tg_send_text(chat_id: int, text: str):
     if not (TELEGRAM_API and httpx):
+        _dlog("telegram send skipped:", {"has_api": bool(TELEGRAM_API), "has_httpx": bool(httpx)})
         return
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(f"{TELEGRAM_API}/sendMessage", data={
@@ -75,18 +88,21 @@ async def _tg_send_text(chat_id: int, text: str):
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         })
+        _dlog("telegram send status", r.status_code)
         r.raise_for_status()
 
 
 async def _tg_send_typing(chat_id: int):
     if not (TYPING_FEEDBACK and TELEGRAM_API and httpx):
+        _dlog("typing skipped:", {"TYPING_FEEDBACK": TYPING_FEEDBACK, "has_api": bool(TELEGRAM_API), "has_httpx": bool(httpx)})
         return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(f"{TELEGRAM_API}/sendChatAction", data={
+            r = await client.post(f"{TELEGRAM_API}/sendChatAction", data={
                 "chat_id": chat_id,
                 "action": "typing"
             })
+            _dlog("typing status", r.status_code)
     except Exception as e:
         print("typing action error:", e)
 
@@ -140,9 +156,12 @@ async def _send_banner_once(chat_id: int) -> bool:
 
 def _openai_client():
     if not OPENAI_API_KEY or OpenAI is None:
+        _dlog("openai client skipped:", {"has_key": bool(OPENAI_API_KEY), "has_sdk": OpenAI is not None})
         return None
     try:
-        return OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        _dlog("openai client ok")
+        return client
     except Exception as e:
         print("OpenAI client init error:", e)
         return None
@@ -154,14 +173,17 @@ async def _router_answer(user_text: str) -> str:
     Делает два варианта вызова: Responses API (новый) и Chat Completions (fallback).
     """
     if not OPENAI_API_KEY:
+        _dlog("no OPENAI_API_KEY")
         return "Техническая пауза: подключаю мозг. Напиши ещё раз через минуту."
 
     client = _openai_client()
     if client is None:
+        _dlog("OpenAI client init failed")
         return "Временная недоступность мозгового центра. Попробуем ещё раз чуть позже."
 
     # Попытка 1: Responses API (новый стиль)
     try:
+        _dlog("responses.create ->", {"model": OPENAI_MODEL, "len_user_text": len(user_text)})
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=[
@@ -171,14 +193,18 @@ async def _router_answer(user_text: str) -> str:
             temperature=0.2,
             max_output_tokens=600,
         )
-        text = getattr(resp, "output_text", "").strip()
+        text = (getattr(resp, "output_text", "") or "").strip()
+        _dlog("responses.create ok", {"len_answer": len(text)})
         if text:
             return text
+        else:
+            _dlog("responses.create empty_text")
     except Exception as e:
-        print("responses.create error:", e)
+        _dlog("responses.create error", repr(e))
 
     # Попытка 2: Chat Completions (fallback на более старый интерфейс)
     try:
+        _dlog("chat.completions.create ->", {"model": OPENAI_MODEL, "len_user_text": len(user_text)})
         ch = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -188,11 +214,15 @@ async def _router_answer(user_text: str) -> str:
             temperature=0.2,
             max_tokens=600,
         )
-        text = (ch.choices[0].message.content or "").strip()
+        c0 = ch.choices[0].message.content if ch and ch.choices else ""
+        text = (c0 or "").strip()
+        _dlog("chat.completions.create ok", {"len_answer": len(text)})
         if text:
             return text
+        else:
+            _dlog("chat.completions.create empty_text")
     except Exception as e:
-        print("chat.completions.create error:", e)
+        _dlog("chat.completions.create error", repr(e))
 
     return "Я на связи, но сейчас техническое окно. Повтори, пожалуйста, мысль — проверю цепочку."
 
@@ -215,6 +245,7 @@ async def _process_update(chat_id: int, update_id: int, user_text: str):
     try:
         snap = out_ref.get()
         if snap.exists and snap.to_dict().get("sent") is True:
+            _dlog("outbox skip duplicate", out_id)
             return
     except Exception as e:
         print("outbox check error:", e)
