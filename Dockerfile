@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # 4. Копируем всё содержимое проекта
 COPY . /app
+# --- BookSoul branding assets ---
+COPY assets/ /app/assets/
+
 
 # 5. Принудительно обновляем main.py — чтобы Docker не тянул кэшированный слой
 COPY src/webhook/main.py /app/src/webhook/main.py
