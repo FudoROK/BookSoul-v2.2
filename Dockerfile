@@ -17,7 +17,6 @@ COPY . /app
 # --- BookSoul branding assets ---
 COPY assets/ /app/assets/
 
-
 # 5. Принудительно обновляем main.py — чтобы Docker не тянул кэшированный слой
 COPY src/webhook/main.py /app/src/webhook/main.py
 
